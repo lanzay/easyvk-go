@@ -13,6 +13,10 @@ import (
 	"io"
 	"errors"
 	"time"
+	//"bytes"
+	"strings"
+	"log"
+	"github.com/influxdata/influxdb-client"
 )
 
 const (
@@ -25,15 +29,17 @@ const (
 		"&display=wap" +
 		"&v=%s" +
 		"&response_type=token"
-	vkReqPerSec = 2
+	vkReqPerSec  = 3
+	vkReqEveryMs = 340 * time.Millisecond //1s = 1000ms //350-Ок
 )
 
-var vkLastGetTime time.Time
+var LogResp func(string, map[string]string, *json.RawMessage)
 
 // VK defines a set of functions for
 // working with VK API.
 type VK struct {
 	AccessToken string
+	LastTimeReq time.Time
 	Version     string
 	Account     Account
 	Board       Board
@@ -46,12 +52,24 @@ type VK struct {
 	User        User
 	Friends     Friends
 	Group       Group
+	Apps        Apps
 }
+
+var logT *influxdb.UDPWriter
 
 func init() {
 	
-	vkLastGetTime = time.Now()
+	inflixServer := "localhost:8089"
 	
+	var err error
+	logT, err = influxdb.NewUDPWriter(inflixServer)
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+func SetLogger(fn func(string, map[string]string, *json.RawMessage)) {
+	LogResp = fn
 }
 
 // WithToken helps to initialize your
@@ -71,6 +89,7 @@ func WithToken(token string) VK {
 	vk.User = User{&vk}
 	vk.Friends = Friends{&vk}
 	vk.Group = Group{&vk}
+	vk.Apps = Apps{&vk}
 	return vk
 }
 
@@ -102,7 +121,7 @@ func WithAuth(login, password, clientID, scope string) (VK, error) {
 	
 	if resp.Request.URL.Path != "/blank.html" {
 		args, u := parseForm(resp.Body)
-		resp, err := client.PostForm(u, args)
+		resp, err = client.PostForm(u, args)
 		if err != nil {
 			return VK{}, err
 		}
@@ -186,21 +205,69 @@ func (vk *VK) Request(method string, params map[string]string) ([]byte, error) {
 	query.Set("access_token", vk.AccessToken)
 	if params["Version"] == "" {
 		query.Set("v", vk.Version)
+		params["v"] = vk.Version
 	}
 	u.RawQuery = query.Encode()
 	
-	targetTime := vkLastGetTime.Add(1000 / vkReqPerSec * time.Millisecond)
+	//Попытки получить данные
+	tryCount := 0
+try:
+	tryCount++
+	
+	targetTime := vk.LastTimeReq.Add(vkReqEveryMs)
 	if time.Now().Before(targetTime) {
 		time.Sleep(targetTime.Sub(time.Now()))
 	}
-	fmt.Println("[DURATION] vkGet", time.Now().Sub(vkLastGetTime))
-	vkLastGetTime = time.Now()
-	resp, err := http.Get(u.String())
+	logReqDelay := time.Since(vk.LastTimeReq) //Сколько мы ждали с предыдущего вызова
+	//fmt.Printf("[DURATION] vkGet %v\n", logReqDelay)
+	vk.LastTimeReq = time.Now()
+	
+	//Основной Запрос в ВК
+	cl := http.Client{
+		Timeout: 10 * time.Second,
+	}
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		log.Panicln("[ERR http.NewRequest]", err)
+	}
+	//req.Header.Add("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.167 Safari/537.36")
+	//req.Header.Add("accept","text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8")
+	//req.Header.Add("accept-encoding","gzip, deflate, br")
+	//req.Header.Add("accept-language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
+	
+	APDEX_vk_start := time.Now() //Тут счиатем чистое время VK на запрос
+	resp, err := cl.Do(req)      //---------========  VK  ==========---------------
+	//resp, vkErr := http.Get(u.String())
+	APDEX_vk_do := time.Since(APDEX_vk_start)
 	
 	if err != nil {
+		log.Println("[ERR vkErr] tryCount:", tryCount, err)
+		//read tcp 192.168.100.10:52059->87.240.129.179:443: wsarecv: An existing connection was forcibly closed by the remote host.
+		//if strings.Contains(err.Error(),"(Client.Timeout exceeded while awaiting headers)") && tryCount <= 10 {
+		if tryCount <= 10 {
+			time.Sleep(10 * time.Second)
+			goto try
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
+	
+	//fmt.Printf("APDEX_vk %s %v ReqDelay:%v Token:%s\n", method, APDEX_vk, logReqDelay, vk.AccessToken)
+	
+	//Log - APDEX
+	pt := influxdb.Point{
+		Name: "apdex_vk",
+		Tags: []influxdb.Tag{{
+			Key:   "Method",
+			Value: strings.Replace(method, ".", "_", -1),
+		}},
+		Fields: map[string]interface{}{
+			"APDEX_vk": APDEX_vk_do.Seconds() * 1000,
+			"ReqDelay": logReqDelay.Seconds() * 1000,
+		},
+		Time: time.Now(),
+	}
+	go pt.WriteTo(logT)
 	
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -215,6 +282,11 @@ func (vk *VK) Request(method string, params map[string]string) ([]byte, error) {
 	
 	if handler.Error != nil {
 		return nil, handler.Error
+	}
+	
+	if LogResp != nil {
+		//LogResp(method, params, &handler.Response)
+		go LogResp(method, params, &handler.Response)
 	}
 	
 	return handler.Response, nil

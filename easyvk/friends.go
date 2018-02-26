@@ -164,3 +164,27 @@ func (o *Friends) GetAll(p FriendsGetParams) (FriendsGetResponse, error) {
 	
 	return all, nil
 }
+
+func (o *Friends) GetAllById(id int) (FriendsGetResponse, error) {
+	
+	offset := 0
+	all := FriendsGetResponse{}
+	for {
+		params := FriendsGetParams{
+			UserId: id,
+			Count:  1000,
+			Offset: offset,
+		}
+		items, err := o.Get(params)
+		if err != nil {
+			return FriendsGetResponse{}, err
+		}
+		all.Items = append(all.Items, items.Items...)
+		if (len(items.Items) + offset) >= items.Count {
+			break
+		}
+		offset += len(items.Items)
+	}
+	
+	return all, nil
+}
